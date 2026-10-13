@@ -373,11 +373,30 @@ def test_expand_keeps_the_short_link_when_it_cannot_be_followed(monkeypatch):
 
 
 def test_expand_never_touches_other_hosts(monkeypatch):
-    def boom(*a, **k):
-        raise AssertionError("fetched a non-shortener url")
-
-    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", boom)
+    fetched = []
+    monkeypatch.setattr(
+        cryo_bridge.urllib.request, "urlopen", lambda *a, **k: fetched.append(a)
+    )
     assert expand("https://example.com/a") == "https://example.com/a"
+    assert fetched == []
+
+
+def test_a_malformed_link_does_not_fail_the_note():
+    cryo = FakeCryo()
+    outcome = bridge(note(body="see http://[abc/x and https://a.com/y"), ME, cryo)
+    assert outcome == "queued-text-held"
+    assert cryo.calls == [(["http://[abc/x", "https://a.com/y"], "Article title")]
+
+
+def test_a_refused_redirect_onto_another_short_host_keeps_the_original(monkeypatch):
+    class ToShortThatRefuses(ShortToPage):
+        location = "http://localhost:{port}/other"
+        status = 403
+
+    server, short = serve_short(monkeypatch, ToShortThatRefuses)
+    assert expand(short, timeout=5) == short
+    server.shutdown()
+    server.server_close()
 
 
 def test_bridge_sends_expanded_links_once():
@@ -394,7 +413,7 @@ def test_links_past_the_expansion_budget_stay_short(monkeypatch):
     clock = iter([0, 0, cryo_bridge.EXPAND_BUDGET_S + 1])
     monkeypatch.setattr(cryo_bridge.time, "monotonic", lambda: next(clock))
     cryo = FakeCryo()
-    body = "https://share.google/a https://share.google/b"
+    body = "read these https://share.google/a https://share.google/b"
     outcome = bridge(
         note(body=body),
         ME,

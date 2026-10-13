@@ -153,7 +153,10 @@ def expand(url: str, timeout: int = 10) -> str:
 
 
 def _host(url: str) -> str | None:
-    return urllib.parse.urlsplit(url).hostname
+    try:
+        return urllib.parse.urlsplit(url).hostname
+    except ValueError:  # e.g. "http://[abc/x", which URL_RE lets through
+        return None
 
 
 class Cryo:
