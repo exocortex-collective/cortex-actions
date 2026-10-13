@@ -17,3 +17,13 @@ subscriptions:
   - label: "Cortex/Family/School/*"
     queue: school
     events: [added]
+
+  # Self-notes (Devon emailing himself links) go to cryo's backlog queues via
+  # actions.services.cryo_bridge. Self/Archive is a different request and is
+  # not routed.
+  - label: "Cortex/Self/Note"
+    queue: cryo-backlog
+    events: [added]
+  - label: "Cortex/Self/Todo"
+    queue: cryo-backlog
+    events: [added]
