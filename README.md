@@ -177,6 +177,24 @@ and verify it drains before flipping that flag.**
 | `METRICS_PORT` | Prometheus `/metrics`, in-container | `8000` |
 | `LOG_LEVEL` | | `INFO` |
 
+## Consumer: cryo bridge
+
+`python -m actions.services.cryo_bridge` consumes the `cryo-backlog` queue,
+which the routing table fills from `Cortex/Self/Note` and `Cortex/Self/Todo`.
+An email that Devon's account sent to itself alone (Gmail `SENT` label,
+from = to = `SELF_ADDRESS`, no cc) has each link in its body queued in cryo's
+backlog, with the subject as the title. Text typed around the links is not
+sent yet: as a cryo note it would bind cryo's classifier as Devon's words.
+`--once` processes one batch and exits.
+
+| var | meaning |
+|---|---|
+| `POSTGRES_*` | as above |
+| `CRYO_URL` | cryod base URL; required, no default |
+| `CRYO_TOKEN` | cryod bearer token; required |
+| `SELF_ADDRESS` | the account's own address; required |
+| `POLL_INTERVAL` | idle seconds between claims (default `5`) |
+
 ## Metrics
 
 - `cortex_actions_routed_total{label_prefix,queue}` — events **enqueued**
