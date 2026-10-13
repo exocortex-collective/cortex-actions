@@ -2,6 +2,7 @@ import inspect
 import json
 import threading
 import urllib.error
+from http.client import BadStatusLine
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -12,9 +13,11 @@ from prometheus_client import REGISTRY
 from actions.services import cryo_bridge
 from actions.services.cryo_bridge import (
     RETRYABLE_HTTP,
+    SHORTENER_HOSTS,
     Cryo,
     Email,
     bridge,
+    expand,
     html_note,
     is_self_note,
     load_email,
@@ -167,11 +170,11 @@ def test_bridge_never_calls_cryo_for_a_non_self_note():
     assert cryo.calls == []
 
 
-def test_shipped_config_routes_self_notes_to_cryo_but_not_archive():
+def test_shipped_config_routes_every_self_note_label_to_cryo():
     subs = load(Path(__file__).parent.parent / "config" / "subscriptions.yaml")
-    assert targets(subs, "Cortex/Self/Note", "added") == ["cryo-backlog"]
-    assert targets(subs, "Cortex/Self/Todo", "added") == ["cryo-backlog"]
-    assert targets(subs, "Cortex/Self/Archive", "added") == []
+    for label in ("Cortex/Self/Note", "Cortex/Self/Todo", "Cortex/Self/Archive"):
+        assert targets(subs, label, "added") == ["cryo-backlog"]
+        assert targets(subs, label, "removed") == []
 
 
 # --- the two boundaries: cryod over HTTP, and the email row ---
@@ -232,6 +235,206 @@ def test_an_empty_200_from_cryod_is_an_error_not_a_silent_null():
     with pytest.raises(ValueError):
         cryo.enqueue(["https://a.com"], None)
     server.server_close()
+
+
+class Redirector(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            self.send_header("Location", "/real/page")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class ShortToPage(BaseHTTPRequestHandler):
+    """A short link on host localhost that redirects to a page on 127.0.0.1;
+    `status` is what the page answers."""
+
+    status = 200
+    location = None
+
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            port = self.server.server_address[1]
+            dest = self.location or f"http://127.0.0.1:{port}/real/page"
+            self.send_header("Location", dest.format(port=port))
+        else:
+            self.send_response(self.status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def serve_short(monkeypatch, handler):
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"localhost"}))
+    return server, f"http://localhost:{server.server_port}/short"
+
+
+def test_expand_follows_a_short_link_to_its_page(monkeypatch):
+    server, short = serve_short(monkeypatch, ShortToPage)
+    port = server.server_port
+    assert expand(short, timeout=5) == f"http://127.0.0.1:{port}/real/page"
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_a_link_that_lands_on_another_short_host(monkeypatch):
+    class ToShort(ShortToPage):
+        location = "http://localhost:{port}/still-short"
+
+    server, short = serve_short(monkeypatch, ToShort)
+    assert expand(short, timeout=5) == short
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_a_link_that_lands_on_a_non_http_url(monkeypatch):
+    class Landed:
+        url = "ftp://example.com/x"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"s.example"}))
+    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", lambda *a, **k: Landed())
+    assert expand("https://s.example/x") == "https://s.example/x"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BadStatusLine("garbage"),
+        OSError("reset"),
+        ValueError("bad url"),
+        urllib.error.URLError("dns"),
+    ],
+)
+def test_expand_keeps_the_short_link_on_any_failure(monkeypatch, exc):
+    def boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"s.example"}))
+    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", boom)
+    assert expand("https://s.example/x") == "https://s.example/x"
+
+
+def test_the_short_hosts_are_googles():
+    assert {"share.google", "search.app", "goo.gl", "g.co"} == SHORTENER_HOSTS
+
+
+class RefusingDestination(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            port = self.server.server_address[1]
+            self.send_header("Location", f"http://127.0.0.1:{port}/real/page")
+        else:
+            self.send_response(403)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_destination_that_refuses_still_gives_its_url(monkeypatch):
+    server = HTTPServer(("127.0.0.1", 0), RefusingDestination)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"localhost"}))
+    port = server.server_port
+    assert expand(f"http://localhost:{port}/short", timeout=5) == (
+        f"http://127.0.0.1:{port}/real/page"
+    )
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_the_short_link_when_it_cannot_be_followed(monkeypatch):
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"127.0.0.1"}))
+    dead = HTTPServer(("127.0.0.1", 0), Redirector)
+    port = dead.server_port
+    dead.server_close()
+    assert expand(f"http://127.0.0.1:{port}/short", timeout=2) == (
+        f"http://127.0.0.1:{port}/short"
+    )
+
+
+def test_expand_never_touches_other_hosts(monkeypatch):
+    fetched = []
+    monkeypatch.setattr(
+        cryo_bridge.urllib.request, "urlopen", lambda *a, **k: fetched.append(a)
+    )
+    assert expand("https://example.com/a") == "https://example.com/a"
+    assert fetched == []
+
+
+def test_a_malformed_link_does_not_fail_the_note():
+    cryo = FakeCryo()
+    outcome = bridge(note(body="see http://[abc/x and https://a.com/y"), ME, cryo)
+    assert outcome == "queued-text-held"
+    assert cryo.calls == [(["http://[abc/x", "https://a.com/y"], "Article title")]
+
+
+def test_a_refused_redirect_onto_another_short_host_keeps_the_original(monkeypatch):
+    class ToShortThatRefuses(ShortToPage):
+        location = "http://localhost:{port}/other"
+        status = 403
+
+    server, short = serve_short(monkeypatch, ToShortThatRefuses)
+    assert expand(short, timeout=5) == short
+    server.shutdown()
+    server.server_close()
+
+
+def test_bridge_sends_expanded_links_once():
+    cryo = FakeCryo()
+    body = "https://share.google/a https://share.google/b https://x.com/c"
+    real = {"https://share.google/a": "https://x.com/c"}
+    bridge(note(body=body), ME, cryo, expand_url=lambda u: real.get(u, u))
+    assert cryo.calls == [
+        (["https://x.com/c", "https://share.google/b"], "Article title")
+    ]
+
+
+def test_links_past_the_expansion_budget_stay_short(monkeypatch):
+    clock = iter([0, 0, cryo_bridge.EXPAND_BUDGET_S + 1])
+    monkeypatch.setattr(cryo_bridge.time, "monotonic", lambda: next(clock))
+    cryo = FakeCryo()
+    body = "read these https://share.google/a https://share.google/b"
+    outcome = bridge(
+        note(body=body),
+        ME,
+        cryo,
+        expand_url=lambda u: u.replace("share.google", "x.com"),
+    )
+    assert cryo.calls == [
+        (["https://x.com/a", "https://share.google/b"], "Article title")
+    ]
+    assert outcome == "queued-unexpanded"
+
+
+def test_a_fully_expanded_note_is_plain_queued():
+    cryo = FakeCryo()
+    outcome = bridge(
+        note(body="https://share.google/a"),
+        ME,
+        cryo,
+        expand_url=lambda u: "https://x.com/a",
+    )
+    assert outcome == "queued"
 
 
 class RowConn:
@@ -414,5 +617,5 @@ def test_run_once_claims_a_batch_that_fits_the_visibility_timeout(monkeypatch, q
     monkeypatch.setattr(cryo_bridge, "load_email", lambda conn, gid: note())
     b = cryo_bridge.Bridge("dsn", ME, FakeCryo(), poll_interval=1)
     assert b.run_once(FakeConn()) == 1
-    assert queue["claimed"] == [("cryo-backlog", 5, 5)]
+    assert queue["claimed"] == [("cryo-backlog", 1, 5)]
     assert queue["log"] == [("complete", 7)]

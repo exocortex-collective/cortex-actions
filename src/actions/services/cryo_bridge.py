@@ -22,8 +22,11 @@ import re
 import signal
 import sys
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from types import FrameType
@@ -40,6 +43,11 @@ QUEUE = "cryo-backlog"
 URL_RE = re.compile(r"https?://[^\s<>\"'\]]+")
 # 401/403: a fixed token or permission makes these succeed later; 408/429: wait.
 RETRYABLE_HTTP = frozenset({401, 403, 408, 429})
+# Android's share sheet wraps links in Google short links, which hide the real
+# page from cryo (and turn a YouTube share into a "page" item).
+SHORTENER_HOSTS = frozenset({"share.google", "search.app", "goo.gl", "g.co"})
+# Total time one email may spend expanding links; later links stay short.
+EXPAND_BUDGET_S = 60
 # Sentence punctuation that ends a pasted URL more often than it belongs to it.
 URL_TRAILING = ".,;:!?"
 
@@ -114,6 +122,43 @@ def html_note(body: str) -> tuple[list[str], str]:
     return urls, text
 
 
+def expand(url: str, timeout: int = 10) -> str:
+    """The page a Google short link points at; any other url unchanged.
+
+    GET, not HEAD: share.google only redirects onward on GET. The body is
+    never read. On any failure the short link is kept, and logged.
+    """
+    if _host(url) not in SHORTENER_HOSTS:
+        return url
+
+    def landed(final: str) -> str:
+        if _host(final) in SHORTENER_HOSTS or not final.startswith(
+            ("http://", "https://")
+        ):
+            logger.warning("short link did not expand", url=url, landed=final)
+            return url
+        return final
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return landed(str(resp.url))
+    except urllib.error.HTTPError as exc:
+        # The redirects completed and the destination refused us (403 to
+        # urllib's user agent is common); its url is still the answer.
+        logger.info("short link destination refused", url=url, status=exc.code)
+        return landed(str(exc.url))
+    except Exception as exc:  # noqa: BLE001 - one link must never fail the note
+        logger.warning("could not expand short link", url=url, error=repr(exc))
+        return url
+
+
+def _host(url: str) -> str | None:
+    try:
+        return urllib.parse.urlsplit(url).hostname
+    except ValueError:  # e.g. "http://[abc/x", which URL_RE lets through
+        return None
+
+
 class Cryo:
     """The cryod call the bridge makes."""
 
@@ -166,7 +211,12 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
     )
 
 
-def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
+def bridge(
+    email: Email,
+    self_addr: str,
+    cryo: Cryo,
+    expand_url: Callable[[str], str] = expand,
+) -> str:
     """Hand one email to cryo. Returns the outcome; raises if cryod fails.
     Safe to repeat: cryod skips a url already in that kind's backlog."""
     if not is_self_note(email, self_addr):
@@ -174,8 +224,15 @@ def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
     urls, text = split_note(email.body) if email.body else html_note(email.html)
     if not urls:
         return "no-links"
+    deadline = time.monotonic() + EXPAND_BUDGET_S
+    urls = list(
+        dict.fromkeys(expand_url(u) if time.monotonic() < deadline else u for u in urls)
+    )
+    short = sum(_host(u) in SHORTENER_HOSTS for u in urls)
     result = cryo.enqueue(urls, email.subject or None)
-    logger.info("cryod enqueue", links=len(urls), result=result)
+    logger.info("cryod enqueue", links=len(urls), unexpanded=short, result=result)
+    if short:
+        return "queued-unexpanded"
     return "queued-text-held" if text else "queued"
 
 
@@ -240,9 +297,10 @@ class Bridge:
             return retry(exc)
 
     def run_once(self, conn: Any) -> int:
-        # 5 jobs x 30s cryod timeout stays inside the 5 minute claim.
+        # One email per claim: its expansion budget plus the 30s cryod call
+        # stays well inside the 5 minute claim.
         jobs = claim(
-            conn, QUEUE, worker=self._worker, limit=5, visibility_timeout_min=5
+            conn, QUEUE, worker=self._worker, limit=1, visibility_timeout_min=5
         )
         for job in jobs:
             self.process(conn, job)

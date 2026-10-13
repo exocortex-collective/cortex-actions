@@ -180,12 +180,16 @@ and verify it drains before flipping that flag.**
 ## Consumer: cryo bridge
 
 `python -m actions.services.cryo_bridge` consumes the `cryo-backlog` queue,
-which the routing table fills from `Cortex/Self/Note` and `Cortex/Self/Todo`.
+which the routing table fills from `Cortex/Self/Note`, `Cortex/Self/Todo`
+and `Cortex/Self/Archive`.
 An email that Devon's account sent to itself alone (Gmail `SENT` label,
 from = to = `SELF_ADDRESS`, no cc) has each link in its body queued in cryo's
 backlog, with the subject as the title. Text typed around the links is not
 sent yet: as a cryo note it would bind cryo's classifier as Devon's words.
-`--once` processes one batch and exits.
+Google short links (`share.google`, `search.app`, …) are expanded to the page
+first, within a 60s budget per email; a link that will not expand is still
+queued and counted as `queued-unexpanded`. `--once` processes one email and
+exits.
 
 | var | meaning |
 |---|---|
