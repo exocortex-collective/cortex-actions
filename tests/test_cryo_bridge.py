@@ -15,6 +15,7 @@ from actions.services.cryo_bridge import (
     Cryo,
     Email,
     bridge,
+    expand,
     html_note,
     is_self_note,
     load_email,
@@ -167,11 +168,11 @@ def test_bridge_never_calls_cryo_for_a_non_self_note():
     assert cryo.calls == []
 
 
-def test_shipped_config_routes_self_notes_to_cryo_but_not_archive():
+def test_shipped_config_routes_every_self_note_label_to_cryo():
     subs = load(Path(__file__).parent.parent / "config" / "subscriptions.yaml")
-    assert targets(subs, "Cortex/Self/Note", "added") == ["cryo-backlog"]
-    assert targets(subs, "Cortex/Self/Todo", "added") == ["cryo-backlog"]
-    assert targets(subs, "Cortex/Self/Archive", "added") == []
+    for label in ("Cortex/Self/Note", "Cortex/Self/Todo", "Cortex/Self/Archive"):
+        assert targets(subs, label, "added") == ["cryo-backlog"]
+        assert targets(subs, label, "removed") == []
 
 
 # --- the two boundaries: cryod over HTTP, and the email row ---
@@ -232,6 +233,75 @@ def test_an_empty_200_from_cryod_is_an_error_not_a_silent_null():
     with pytest.raises(ValueError):
         cryo.enqueue(["https://a.com"], None)
     server.server_close()
+
+
+class Redirector(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            self.send_header("Location", "/real/page")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class RefusingDestination(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            port = self.server.server_address[1]
+            self.send_header("Location", f"http://127.0.0.1:{port}/real/page")
+        else:
+            self.send_response(403)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_a_destination_that_refuses_still_gives_its_url(monkeypatch):
+    server = HTTPServer(("127.0.0.1", 0), RefusingDestination)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"localhost"}))
+    port = server.server_port
+    assert expand(f"http://localhost:{port}/short", timeout=5) == (
+        f"http://127.0.0.1:{port}/real/page"
+    )
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_the_short_link_when_it_cannot_be_followed(monkeypatch):
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"127.0.0.1"}))
+    dead = HTTPServer(("127.0.0.1", 0), Redirector)
+    port = dead.server_port
+    dead.server_close()
+    assert expand(f"http://127.0.0.1:{port}/short", timeout=2) == (
+        f"http://127.0.0.1:{port}/short"
+    )
+
+
+def test_expand_never_touches_other_hosts(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("fetched a non-shortener url")
+
+    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", boom)
+    assert expand("https://example.com/a") == "https://example.com/a"
+
+
+def test_bridge_sends_expanded_links_once():
+    cryo = FakeCryo()
+    body = "https://share.google/a https://share.google/b https://x.com/c"
+    real = {"https://share.google/a": "https://x.com/c"}
+    bridge(note(body=body), ME, cryo, expand_url=lambda u: real.get(u, u))
+    assert cryo.calls == [
+        (["https://x.com/c", "https://share.google/b"], "Article title")
+    ]
 
 
 class RowConn:

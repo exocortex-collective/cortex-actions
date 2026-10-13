@@ -180,7 +180,8 @@ and verify it drains before flipping that flag.**
 ## Consumer: cryo bridge
 
 `python -m actions.services.cryo_bridge` consumes the `cryo-backlog` queue,
-which the routing table fills from `Cortex/Self/Note` and `Cortex/Self/Todo`.
+which the routing table fills from `Cortex/Self/Note`, `Cortex/Self/Todo`
+and `Cortex/Self/Archive`.
 An email that Devon's account sent to itself alone (Gmail `SENT` label,
 from = to = `SELF_ADDRESS`, no cc) has each link in its body queued in cryo's
 backlog, with the subject as the title. Text typed around the links is not

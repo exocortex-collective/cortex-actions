@@ -19,8 +19,11 @@ subscriptions:
     events: [added]
 
   # Self-notes (Devon emailing himself links) go to cryo's backlog queues via
-  # actions.services.cryo_bridge. Self/Archive is a different request and is
-  # not routed.
+  # actions.services.cryo_bridge, including Self/Archive (links saved for
+  # reference).
+  - label: "Cortex/Self/Archive"
+    queue: cryo-backlog
+    events: [added]
   - label: "Cortex/Self/Note"
     queue: cryo-backlog
     events: [added]

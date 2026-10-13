@@ -23,7 +23,9 @@ import signal
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from types import FrameType
@@ -40,6 +42,9 @@ QUEUE = "cryo-backlog"
 URL_RE = re.compile(r"https?://[^\s<>\"'\]]+")
 # 401/403: a fixed token or permission makes these succeed later; 408/429: wait.
 RETRYABLE_HTTP = frozenset({401, 403, 408, 429})
+# Android's share sheet wraps links in Google short links, which hide the real
+# page from cryo (and turn a YouTube share into a "page" item).
+SHORTENER_HOSTS = frozenset({"share.google", "search.app", "goo.gl", "g.co"})
 # Sentence punctuation that ends a pasted URL more often than it belongs to it.
 URL_TRAILING = ".,;:!?"
 
@@ -114,6 +119,28 @@ def html_note(body: str) -> tuple[list[str], str]:
     return urls, text
 
 
+def expand(url: str, timeout: int = 10) -> str:
+    """The page a Google short link points at; any other url unchanged.
+
+    GET, not HEAD: share.google only redirects onward on GET. The body is
+    never read. On any failure the short link is kept rather than lost.
+    """
+    if urllib.parse.urlsplit(url).hostname not in SHORTENER_HOSTS:
+        return url
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            final = str(resp.url)
+    except urllib.error.HTTPError as exc:
+        # The redirects completed and the destination site refused us (403
+        # to urllib's user agent is common); its url is still the answer.
+        final = str(exc.url)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        logger.warning("could not expand short link", url=url, error=repr(exc))
+        return url
+    expanded = urllib.parse.urlsplit(final).hostname not in SHORTENER_HOSTS
+    return final if expanded and final.startswith(("http://", "https://")) else url
+
+
 class Cryo:
     """The cryod call the bridge makes."""
 
@@ -166,7 +193,12 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
     )
 
 
-def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
+def bridge(
+    email: Email,
+    self_addr: str,
+    cryo: Cryo,
+    expand_url: Callable[[str], str] = expand,
+) -> str:
     """Hand one email to cryo. Returns the outcome; raises if cryod fails.
     Safe to repeat: cryod skips a url already in that kind's backlog."""
     if not is_self_note(email, self_addr):
@@ -174,6 +206,7 @@ def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
     urls, text = split_note(email.body) if email.body else html_note(email.html)
     if not urls:
         return "no-links"
+    urls = list(dict.fromkeys(expand_url(u) for u in urls))
     result = cryo.enqueue(urls, email.subject or None)
     logger.info("cryod enqueue", links=len(urls), result=result)
     return "queued-text-held" if text else "queued"
