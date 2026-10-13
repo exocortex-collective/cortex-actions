@@ -119,6 +119,19 @@ def test_html_note_takes_decoded_anchor_targets_only():
     assert text == "read this"
 
 
+def test_html_note_keeps_every_anchor_in_order_once():
+    urls, _ = html_note(
+        '<a href="https://a.com/1">a</a><a href="https://b.com/2">b</a>'
+        '<a href="https://a.com/1">again</a>'
+    )
+    assert urls == ["https://a.com/1", "https://b.com/2"]
+
+
+def test_html_note_ignores_urls_outside_href():
+    urls, _ = html_note('<a title="https://t.com/x" href="">x</a>')
+    assert urls == []
+
+
 def test_an_html_only_body_is_read_from_html():
     cryo = FakeCryo()
     email = note(body="", html='<a href="https://a.com/x">x</a>')
@@ -204,6 +217,23 @@ def test_enqueue_posts_items_with_the_bearer_token():
     ]
 
 
+class EmptyCryod(CryodStub):
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def test_an_empty_200_from_cryod_is_an_error_not_a_silent_null():
+    server = HTTPServer(("127.0.0.1", 0), EmptyCryod)
+    threading.Thread(target=server.handle_request, daemon=True).start()
+    cryo = Cryo(f"http://127.0.0.1:{server.server_port}", "tok", timeout=5)
+    with pytest.raises(ValueError):
+        cryo.enqueue(["https://a.com"], None)
+    server.server_close()
+
+
 class RowConn:
     def __init__(self, row):
         self.row, self.executed = row, []
@@ -238,6 +268,22 @@ def test_load_email_maps_a_row_with_both_bodies():
     assert load_email(conn, "g1") == Email(
         ME, (ME,), (), "S", "t", ("SENT",), "<p>h</p>"
     )
+
+
+def test_load_email_selects_the_columns_it_unpacks_in_order():
+    conn = RowConn(None)
+    load_email(conn, "g1")
+    sql = " ".join(conn.executed[0][0].split())
+    selected = sql.split("SELECT ", 1)[1].split(" FROM ", 1)[0]
+    assert [c.strip() for c in selected.split(",")] == [
+        "p.from_addr",
+        "p.to_addrs",
+        "p.cc_addrs",
+        "p.subject",
+        "p.body_text",
+        "r.label_ids",
+        "p.body_html",
+    ]
 
 
 def test_load_email_returns_none_for_no_row():
