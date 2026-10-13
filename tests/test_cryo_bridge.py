@@ -2,6 +2,7 @@ import inspect
 import json
 import threading
 import urllib.error
+from http.client import BadStatusLine
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from prometheus_client import REGISTRY
 from actions.services import cryo_bridge
 from actions.services.cryo_bridge import (
     RETRYABLE_HTTP,
+    SHORTENER_HOSTS,
     Cryo,
     Email,
     bridge,
@@ -249,6 +251,90 @@ class Redirector(BaseHTTPRequestHandler):
         pass
 
 
+class ShortToPage(BaseHTTPRequestHandler):
+    """A short link on host localhost that redirects to a page on 127.0.0.1;
+    `status` is what the page answers."""
+
+    status = 200
+    location = None
+
+    def do_GET(self):
+        if self.path == "/short":
+            self.send_response(302)
+            port = self.server.server_address[1]
+            dest = self.location or f"http://127.0.0.1:{port}/real/page"
+            self.send_header("Location", dest.format(port=port))
+        else:
+            self.send_response(self.status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def serve_short(monkeypatch, handler):
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"localhost"}))
+    return server, f"http://localhost:{server.server_port}/short"
+
+
+def test_expand_follows_a_short_link_to_its_page(monkeypatch):
+    server, short = serve_short(monkeypatch, ShortToPage)
+    port = server.server_port
+    assert expand(short, timeout=5) == f"http://127.0.0.1:{port}/real/page"
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_a_link_that_lands_on_another_short_host(monkeypatch):
+    class ToShort(ShortToPage):
+        location = "http://localhost:{port}/still-short"
+
+    server, short = serve_short(monkeypatch, ToShort)
+    assert expand(short, timeout=5) == short
+    server.shutdown()
+    server.server_close()
+
+
+def test_expand_keeps_a_link_that_lands_on_a_non_http_url(monkeypatch):
+    class Landed:
+        url = "ftp://example.com/x"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"s.example"}))
+    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", lambda *a, **k: Landed())
+    assert expand("https://s.example/x") == "https://s.example/x"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BadStatusLine("garbage"),
+        OSError("reset"),
+        ValueError("bad url"),
+        urllib.error.URLError("dns"),
+    ],
+)
+def test_expand_keeps_the_short_link_on_any_failure(monkeypatch, exc):
+    def boom(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(cryo_bridge, "SHORTENER_HOSTS", frozenset({"s.example"}))
+    monkeypatch.setattr(cryo_bridge.urllib.request, "urlopen", boom)
+    assert expand("https://s.example/x") == "https://s.example/x"
+
+
+def test_the_short_hosts_are_googles():
+    assert {"share.google", "search.app", "goo.gl", "g.co"} == SHORTENER_HOSTS
+
+
 class RefusingDestination(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/short":
@@ -302,6 +388,34 @@ def test_bridge_sends_expanded_links_once():
     assert cryo.calls == [
         (["https://x.com/c", "https://share.google/b"], "Article title")
     ]
+
+
+def test_links_past_the_expansion_budget_stay_short(monkeypatch):
+    clock = iter([0, 0, cryo_bridge.EXPAND_BUDGET_S + 1])
+    monkeypatch.setattr(cryo_bridge.time, "monotonic", lambda: next(clock))
+    cryo = FakeCryo()
+    body = "https://share.google/a https://share.google/b"
+    outcome = bridge(
+        note(body=body),
+        ME,
+        cryo,
+        expand_url=lambda u: u.replace("share.google", "x.com"),
+    )
+    assert cryo.calls == [
+        (["https://x.com/a", "https://share.google/b"], "Article title")
+    ]
+    assert outcome == "queued-unexpanded"
+
+
+def test_a_fully_expanded_note_is_plain_queued():
+    cryo = FakeCryo()
+    outcome = bridge(
+        note(body="https://share.google/a"),
+        ME,
+        cryo,
+        expand_url=lambda u: "https://x.com/a",
+    )
+    assert outcome == "queued"
 
 
 class RowConn:
@@ -484,5 +598,5 @@ def test_run_once_claims_a_batch_that_fits_the_visibility_timeout(monkeypatch, q
     monkeypatch.setattr(cryo_bridge, "load_email", lambda conn, gid: note())
     b = cryo_bridge.Bridge("dsn", ME, FakeCryo(), poll_interval=1)
     assert b.run_once(FakeConn()) == 1
-    assert queue["claimed"] == [("cryo-backlog", 5, 5)]
+    assert queue["claimed"] == [("cryo-backlog", 1, 5)]
     assert queue["log"] == [("complete", 7)]

@@ -22,6 +22,7 @@ import re
 import signal
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +46,8 @@ RETRYABLE_HTTP = frozenset({401, 403, 408, 429})
 # Android's share sheet wraps links in Google short links, which hide the real
 # page from cryo (and turn a YouTube share into a "page" item).
 SHORTENER_HOSTS = frozenset({"share.google", "search.app", "goo.gl", "g.co"})
+# Total time one email may spend expanding links; later links stay short.
+EXPAND_BUDGET_S = 60
 # Sentence punctuation that ends a pasted URL more often than it belongs to it.
 URL_TRAILING = ".,;:!?"
 
@@ -123,22 +126,34 @@ def expand(url: str, timeout: int = 10) -> str:
     """The page a Google short link points at; any other url unchanged.
 
     GET, not HEAD: share.google only redirects onward on GET. The body is
-    never read. On any failure the short link is kept rather than lost.
+    never read. On any failure the short link is kept, and logged.
     """
-    if urllib.parse.urlsplit(url).hostname not in SHORTENER_HOSTS:
+    if _host(url) not in SHORTENER_HOSTS:
         return url
+
+    def landed(final: str) -> str:
+        if _host(final) in SHORTENER_HOSTS or not final.startswith(
+            ("http://", "https://")
+        ):
+            logger.warning("short link did not expand", url=url, landed=final)
+            return url
+        return final
+
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            final = str(resp.url)
+            return landed(str(resp.url))
     except urllib.error.HTTPError as exc:
-        # The redirects completed and the destination site refused us (403
-        # to urllib's user agent is common); its url is still the answer.
-        final = str(exc.url)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # The redirects completed and the destination refused us (403 to
+        # urllib's user agent is common); its url is still the answer.
+        logger.info("short link destination refused", url=url, status=exc.code)
+        return landed(str(exc.url))
+    except Exception as exc:  # noqa: BLE001 - one link must never fail the note
         logger.warning("could not expand short link", url=url, error=repr(exc))
         return url
-    expanded = urllib.parse.urlsplit(final).hostname not in SHORTENER_HOSTS
-    return final if expanded and final.startswith(("http://", "https://")) else url
+
+
+def _host(url: str) -> str | None:
+    return urllib.parse.urlsplit(url).hostname
 
 
 class Cryo:
@@ -206,9 +221,15 @@ def bridge(
     urls, text = split_note(email.body) if email.body else html_note(email.html)
     if not urls:
         return "no-links"
-    urls = list(dict.fromkeys(expand_url(u) for u in urls))
+    deadline = time.monotonic() + EXPAND_BUDGET_S
+    urls = list(
+        dict.fromkeys(expand_url(u) if time.monotonic() < deadline else u for u in urls)
+    )
+    short = sum(_host(u) in SHORTENER_HOSTS for u in urls)
     result = cryo.enqueue(urls, email.subject or None)
-    logger.info("cryod enqueue", links=len(urls), result=result)
+    logger.info("cryod enqueue", links=len(urls), unexpanded=short, result=result)
+    if short:
+        return "queued-unexpanded"
     return "queued-text-held" if text else "queued"
 
 
@@ -273,9 +294,10 @@ class Bridge:
             return retry(exc)
 
     def run_once(self, conn: Any) -> int:
-        # 5 jobs x 30s cryod timeout stays inside the 5 minute claim.
+        # One email per claim: its expansion budget plus the 30s cryod call
+        # stays well inside the 5 minute claim.
         jobs = claim(
-            conn, QUEUE, worker=self._worker, limit=5, visibility_timeout_min=5
+            conn, QUEUE, worker=self._worker, limit=1, visibility_timeout_min=5
         )
         for job in jobs:
             self.process(conn, job)
