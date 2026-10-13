@@ -7,9 +7,7 @@ on:
     branches: [main]
 
 env:
-  GCP_PROJECT_ID: cortex-gmail
-  GCP_REGION: us-central1
-  IMAGE_NAME: us-central1-docker.pkg.dev/cortex-gmail/cortex/actions
+  IMAGE_NAME: ghcr.io/exocortex-collective/actions
 
 jobs:
   test:
@@ -39,26 +37,20 @@ jobs:
 
     permissions:
       contents: read
-      id-token: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: google-github-actions/auth@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          workload_identity_provider: projects/63779650346/locations/global/workloadIdentityPools/github-actions/providers/github-provider
-          service_account: github-actions@cortex-gmail.iam.gserviceaccount.com
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
-
-      - name: Configure Docker
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
-        run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+        run: docker build --label org.opencontainers.image.source=https://github.com/${{ github.repository }} -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
 
       - name: Push image
         run: |
