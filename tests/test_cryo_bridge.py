@@ -15,6 +15,7 @@ from actions.services.cryo_bridge import (
     Cryo,
     Email,
     bridge,
+    html_note,
     is_self_note,
     load_email,
     split_note,
@@ -105,9 +106,24 @@ def test_split_note_drops_a_bare_scheme():
     assert split_note("https://a.com and https://!")[0] == ["https://a.com"]
 
 
-def test_split_note_finds_links_in_html():
-    urls, _ = split_note('<p><a href="https://a.com/x">x</a></p>')
-    assert urls == ["https://a.com/x"]
+def test_split_note_drops_every_unbalanced_closing_paren():
+    assert split_note("(see (https://a.com/x)).")[0] == ["https://a.com/x"]
+
+
+def test_html_note_takes_decoded_anchor_targets_only():
+    urls, text = html_note(
+        '<p>read <a href="https://x.com/a?b=1&amp;c=2">this</a></p>'
+        '<img src="https://x.com/t.gif"><link href="https://x.com/s.css">'
+    )
+    assert urls == ["https://x.com/a?b=1&c=2"]
+    assert text == "read this"
+
+
+def test_an_html_only_body_is_read_from_html():
+    cryo = FakeCryo()
+    email = note(body="", html='<a href="https://a.com/x">x</a>')
+    assert bridge(email, ME, cryo) == "queued-text-held"
+    assert cryo.calls == [(["https://a.com/x"], "Article title")]
 
 
 def test_bridge_queues_links_with_subject_as_title():
@@ -212,15 +228,16 @@ class RowConn:
 
 
 def test_load_email_maps_nulls_to_empty_values():
-    conn = RowConn((None, None, None, None, None, None))
-    assert load_email(conn, "g1") == Email("", (), (), "", "", ())
+    conn = RowConn((None, None, None, None, None, None, None))
+    assert load_email(conn, "g1") == Email("", (), (), "", "", (), "")
     assert conn.executed[0][1] == ("g1",)
 
 
-def test_load_email_maps_a_row_and_falls_back_to_html():
-    conn = RowConn((ME, [ME], [], "S", "<a href=x>", ["SENT"]))
-    assert load_email(conn, "g1") == Email(ME, (ME,), (), "S", "<a href=x>", ("SENT",))
-    assert "COALESCE(NULLIF(p.body_text, ''), p.body_html)" in conn.executed[0][0]
+def test_load_email_maps_a_row_with_both_bodies():
+    conn = RowConn((ME, [ME], [], "S", "t", ["SENT"], "<p>h</p>"))
+    assert load_email(conn, "g1") == Email(
+        ME, (ME,), (), "S", "t", ("SENT",), "<p>h</p>"
+    )
 
 
 def test_load_email_returns_none_for_no_row():
@@ -327,6 +344,13 @@ def test_exhausted_retries_count_as_failed(monkeypatch, queue):
     before = outcome_count("failed")
     run_job(monkeypatch, note(), RaisingCryo(TypeError("boom")))
     assert outcome_count("failed") == before + 1
+
+
+def test_a_stale_retry_is_reported_lost_not_failed(monkeypatch, queue):
+    queue["retry_status"] = "stale"
+    before = outcome_count("failed")
+    assert run_job(monkeypatch, note(), RaisingCryo(TypeError("boom"))) == "lost"
+    assert outcome_count("failed") == before
 
 
 def test_email_not_parsed_is_retried(monkeypatch, queue):

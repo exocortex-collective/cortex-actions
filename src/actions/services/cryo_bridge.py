@@ -25,6 +25,7 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from types import FrameType
 from typing import Any
 
@@ -60,6 +61,7 @@ class Email:
     subject: str
     body: str
     label_ids: tuple[str, ...]
+    html: str = ""
 
 
 def is_self_note(email: Email, self_addr: str) -> bool:
@@ -87,6 +89,31 @@ def split_note(body: str) -> tuple[list[str], str]:
     return urls, text
 
 
+class _Links(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self.hrefs += [v for k, v in attrs if k == "href" and v]
+
+    def handle_data(self, data: str) -> None:
+        self.text.append(data)
+
+
+def html_note(body: str) -> tuple[list[str], str]:
+    """split_note for an HTML-only body: links are the <a href> targets (with
+    entities decoded), never <img src> or other markup, and the text is the
+    visible text."""
+    parser = _Links()
+    parser.feed(body)
+    urls, _ = split_note(" ".join(parser.hrefs))
+    _, text = split_note(" ".join(parser.text))
+    return urls, text
+
+
 class Cryo:
     """The cryod call the bridge makes."""
 
@@ -106,7 +133,7 @@ class Cryo:
             },
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read() or b"null")
+            return json.loads(resp.read())
 
     def enqueue(self, urls: list[str], title: str | None) -> Any:
         items = [{"url": u, "title": title} for u in urls]
@@ -117,8 +144,8 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.from_addr, p.to_addrs, p.cc_addrs, p.subject,
-                   COALESCE(NULLIF(p.body_text, ''), p.body_html), r.label_ids
+            SELECT p.from_addr, p.to_addrs, p.cc_addrs, p.subject, p.body_text,
+                   r.label_ids, p.body_html
             FROM emails_parsed p JOIN emails_raw r USING (gmail_id)
             WHERE p.gmail_id = %s
             """,
@@ -127,7 +154,7 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
         row = cur.fetchone()
     if row is None:
         return None
-    f, to, cc, subject, body, labels = row
+    f, to, cc, subject, body, labels, html = row
     return Email(
         f or "",
         tuple(to or ()),
@@ -135,6 +162,7 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
         subject or "",
         body or "",
         tuple(labels or ()),
+        html or "",
     )
 
 
@@ -143,7 +171,7 @@ def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
     Safe to repeat: cryod skips a url already in that kind's backlog."""
     if not is_self_note(email, self_addr):
         return "not-self"
-    urls, text = split_note(email.body)
+    urls, text = split_note(email.body) if email.body else html_note(email.html)
     if not urls:
         return "no-links"
     result = cryo.enqueue(urls, email.subject or None)
@@ -182,6 +210,9 @@ class Bridge:
         def retry(exc: BaseException) -> str:
             conn.rollback()
             status = fail_or_retry(conn, job["id"], repr(exc), self._worker)
+            if status == "stale":
+                logger.warning("claim lost before retry", gmail_id=gmail_id)
+                return "lost"
             log = logger.warning if status == "pending" else logger.error
             log("cryo bridge failed", gmail_id=gmail_id, error=repr(exc), next=status)
             OUTCOMES.labels(outcome="retry" if status == "pending" else "failed").inc()
