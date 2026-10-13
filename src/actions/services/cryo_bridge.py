@@ -30,11 +30,13 @@ from typing import Any
 
 import psycopg2
 from cortex_utils.logging import configure_logging, get_logger
+from cortex_utils.metrics import start_metrics_server
 from cortex_utils.queue import claim, complete, fail_or_retry, worker_identity
+from prometheus_client import Counter
 
 SERVICE = "cryo-bridge"
 QUEUE = "cryo-backlog"
-URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
+URL_RE = re.compile(r"https?://[^\s<>\"'\]]+")
 # 401/403: a fixed token or permission makes these succeed later; 408/429: wait.
 RETRYABLE_HTTP = frozenset({401, 403, 408, 429})
 # Sentence punctuation that ends a pasted URL more often than it belongs to it.
@@ -42,15 +44,22 @@ URL_TRAILING = ".,;:!?"
 
 logger = get_logger(__name__)
 
+# One count per settled job. A bridge that stops recognising self-notes still
+# completes every job, so "not-self" climbing while "queued" stays flat is the
+# only sign of it. `outcome` is a closed set.
+OUTCOMES = Counter(
+    "cortex_cryo_bridge_outcomes_total", "Self-note jobs by outcome", ["outcome"]
+)
+
 
 @dataclass(frozen=True)
 class Email:
     from_addr: str
-    to_addrs: list[str]
-    cc_addrs: list[str]
+    to_addrs: tuple[str, ...]
+    cc_addrs: tuple[str, ...]
     subject: str
     body: str
-    label_ids: list[str]
+    label_ids: tuple[str, ...]
 
 
 def is_self_note(email: Email, self_addr: str) -> bool:
@@ -69,7 +78,10 @@ def split_note(body: str) -> tuple[list[str], str]:
     urls: list[str] = []
     for raw in URL_RE.findall(body):
         url = raw.rstrip(URL_TRAILING)
-        if url not in urls:
+        # A ")" closing the sentence, not a Wikipedia-style "(bar)" path.
+        while url.endswith(")") and url.count(")") > url.count("("):
+            url = url[:-1].rstrip(URL_TRAILING)
+        if url.split("://", 1)[1] and url not in urls:
             urls.append(url)
     text = " ".join(URL_RE.sub(" ", body).split())
     return urls, text
@@ -105,8 +117,8 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.from_addr, p.to_addrs, p.cc_addrs, p.subject, p.body_text,
-                   r.label_ids
+            SELECT p.from_addr, p.to_addrs, p.cc_addrs, p.subject,
+                   COALESCE(NULLIF(p.body_text, ''), p.body_html), r.label_ids
             FROM emails_parsed p JOIN emails_raw r USING (gmail_id)
             WHERE p.gmail_id = %s
             """,
@@ -116,7 +128,14 @@ def load_email(conn: Any, gmail_id: str) -> Email | None:
     if row is None:
         return None
     f, to, cc, subject, body, labels = row
-    return Email(f or "", to or [], cc or [], subject or "", body or "", labels or [])
+    return Email(
+        f or "",
+        tuple(to or ()),
+        tuple(cc or ()),
+        subject or "",
+        body or "",
+        tuple(labels or ()),
+    )
 
 
 def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
@@ -127,7 +146,8 @@ def bridge(email: Email, self_addr: str, cryo: Cryo) -> str:
     urls, text = split_note(email.body)
     if not urls:
         return "no-links"
-    cryo.enqueue(urls, email.subject or None)
+    result = cryo.enqueue(urls, email.subject or None)
+    logger.info("cryod enqueue", links=len(urls), result=result)
     return "queued-text-held" if text else "queued"
 
 
@@ -156,6 +176,7 @@ class Bridge:
                 return "lost"
             log = logger.error if outcome == "rejected" else logger.info
             log("self-note handled", gmail_id=gmail_id, outcome=outcome)
+            OUTCOMES.labels(outcome=outcome).inc()
             return outcome
 
         def retry(exc: BaseException) -> str:
@@ -163,20 +184,26 @@ class Bridge:
             status = fail_or_retry(conn, job["id"], repr(exc), self._worker)
             log = logger.warning if status == "pending" else logger.error
             log("cryo bridge failed", gmail_id=gmail_id, error=repr(exc), next=status)
+            OUTCOMES.labels(outcome="retry" if status == "pending" else "failed").inc()
             return "retry"
 
         if not gmail_id:
             return settle("rejected")
         try:
             email = load_email(conn, gmail_id)
-            if email is None:  # the parser may not have written it yet
+            if email is None:
                 raise LookupError(f"no parsed email {gmail_id}")
             return settle(bridge(email, self.self_addr, self.cryo))
         except urllib.error.HTTPError as exc:
             if exc.code in RETRYABLE_HTTP or exc.code >= 500:
                 return retry(exc)
             conn.rollback()
-            logger.error("cryod refused the links", gmail_id=gmail_id, status=exc.code)
+            logger.error(
+                "cryod refused the links",
+                gmail_id=gmail_id,
+                status=exc.code,
+                body=exc.read()[:300].decode(errors="replace"),
+            )
             return settle("rejected")
         except Exception as exc:  # noqa: BLE001 - a poison job must fail, not loop
             return retry(exc)
@@ -242,6 +269,7 @@ def main() -> None:
     if "--once" in sys.argv:
         bridge_.run_once(psycopg2.connect(dsn))
         return
+    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8000")))
     bridge_.run()
 
 
