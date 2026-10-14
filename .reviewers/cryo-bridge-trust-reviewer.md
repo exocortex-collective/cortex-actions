@@ -18,8 +18,8 @@ the house, or a forged self-note, reaches cryo's backlog and classifier.
    redirect-only shortener), a body read from the response, or the landed URL's
    scheme check removed. Redirect hops are followed unchecked by design (a
    shortener exists to redirect elsewhere); only the initial host is gated.
-2. **Self-note identity read from anything but the `SENT` label plus exact
-   from/to equality.** `Reply-To`, display name, or a header substring is
+2. **Self-note identity read from anything but the `SENT` label, exact
+   `From` equality, `To` being exactly this account, and no `Cc`.** `Reply-To`, display name, or a header substring is
    forgeable; flag any loosening of `is_self_note`.
 3. **Typed text sent to cryo.** The module docstring says the text around links
    is withheld on purpose. The payload is `url` plus `title=email.subject`
