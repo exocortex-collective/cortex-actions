@@ -1,11 +1,4 @@
-# Configuration notes
-
----
-
 # Agents
-
-Each H2 names a reviewer. The one-line summary tells the main loop **what it
-checks and when to spawn it** — use it to decide whether the PR diff is in scope.
 
 The roster is deliberately short. Project-specific reviewers guard the ways this
 service can quietly stop being trustworthy. The rest of the generic Python pack
@@ -21,15 +14,7 @@ consumer.
 
 ## File scope
 
-| Path | Reviewers |
-|---|---|
-| `src/actions/services/router.py` | queue-contract, routing-silence, metric-cardinality |
-| `src/actions/subscriptions.py` | routing-silence, loop-safety |
-| `config/subscriptions.yaml` | loop-safety |
-| `tests/**` | test-coverage |
-| `src/actions/**`, `config/subscriptions.yaml` | dead-code |
-| `Dockerfile`, `.github/workflows/**` | homelab-values |
-| `README.md`, `CLAUDE.md`, `*.md` | dead-code, plus whichever reviewer owns the behaviour being described |
+Each reviewer's `**Spawn when:**` header is authoritative for its scope.
 
 Documentation is in scope for every reviewer, not a category of its own: a doc
 describing behaviour someone else changed stays wrong indefinitely and reads as
