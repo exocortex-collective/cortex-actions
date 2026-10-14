@@ -23,7 +23,7 @@ prose rather than code, and the sharpest of them (`service="actions"` against an
 emitted `actions-router`) was a query that would have returned no series at all
 — indistinguishable, on a dashboard, from a healthy zero.
 
-The same review found the failure mode that makes this worth a row: a wrong
+The same review found the failure mode that makes this worth recording: a wrong
 identifier in a comment gets copied. `queue_valid_status`, which exists nowhere,
 travelled from a code comment into a test fixture and then into a beads ticket
 before anyone read it off the database.
