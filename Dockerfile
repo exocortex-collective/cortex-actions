@@ -30,4 +30,4 @@ VOLUME /app/config
 
 USER appuser
 
-CMD ["uv", "run", "python", "-m", "actions.services.router"]
+CMD ["/app/.venv/bin/python", "-m", "actions.services.router"]
