@@ -1,7 +1,6 @@
 """Self-note links to cryo's drains through cryo.enqueue_mail() (cortex-wznn)."""
 
 import os
-import uuid
 
 import psycopg2
 import pytest
@@ -94,9 +93,47 @@ def test_a_refused_link_is_counted_and_not_backlogged():
     before = drains("drain-article", "refused")
     cryo = FakeCryo()
     drain = FakeDrain({"https://example.com/a": "refused"})
-    bridge(note(), ME, cryo, lambda u: u, drain)
+    assert bridge(note(), ME, cryo, lambda u: u, drain) == "drained-refused"
     assert cryo.calls == []
     assert drains("drain-article", "refused") == before + 1
+
+
+def test_duplicates_are_counted():
+    before = drains("drain-article", "duplicate")
+    drain = FakeDrain({"https://example.com/a": "duplicate"})
+    assert bridge(note(), ME, FakeCryo(), lambda u: u, drain) == "drained"
+    assert drains("drain-article", "duplicate") == before + 1
+
+
+def test_an_unexpanded_short_link_goes_to_the_backlog_not_a_drain():
+    before = drains("backlog", "unexpanded")
+    cryo, drain = FakeCryo(), FakeDrain()
+    bridge(note(body="https://share.google/abc"), ME, cryo, lambda u: u, drain)
+    assert drain.calls == []
+    assert cryo.calls == [(["https://share.google/abc"], "Article title")]
+    assert drains("backlog", "unexpanded") == before + 1
+
+
+def test_a_capped_link_is_backlogged_before_a_later_link_fails():
+    cryo = FakeCryo()
+
+    def drain(queue, payload):
+        if queue == "drain-youtube":
+            return "capped"
+        raise psycopg2.OperationalError("gone")
+
+    body = f"https://youtu.be/{VIDEO} https://example.com/a"
+    with pytest.raises(psycopg2.OperationalError):
+        bridge(note(body=body), ME, cryo, lambda u: u, drain)
+    assert cryo.calls == [([f"https://youtu.be/{VIDEO}"], "Article title")]
+
+
+def test_a_link_less_note_does_not_touch_the_drain():
+    drain = FakeDrain()
+    assert bridge(note(body="no links"), ME, FakeCryo(), lambda u: u, drain) == (
+        "no-links"
+    )
+    assert drain.calls == []
 
 
 def test_a_non_self_note_never_drains():
@@ -145,10 +182,66 @@ def test_without_a_drain_links_still_go_to_the_backlog(monkeypatch, queue):
     assert cryo.calls == [(["https://example.com/a"], "Article title")]
 
 
+# --- main() wiring of CRYO_DRAIN_ENABLED ---
+
+
+class BridgeRecorder:
+    made: list = []
+
+    def __init__(self, dsn, self_addr, cryo, poll_interval, drain=None):
+        BridgeRecorder.made.append(drain)
+
+    def run(self):
+        pass
+
+
+@pytest.fixture
+def boot(monkeypatch):
+    for v in (
+        "POSTGRES_HOST",
+        "POSTGRES_DB",
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "CRYO_URL",
+        "CRYO_TOKEN",
+        "SELF_ADDRESS",
+    ):
+        monkeypatch.setenv(v, "x")
+    monkeypatch.setattr(cryo_bridge, "Bridge", BridgeRecorder)
+    monkeypatch.setattr(cryo_bridge, "start_metrics_server", lambda port: None)
+    monkeypatch.setattr(cryo_bridge.signal, "signal", lambda sig, fn: None)
+    monkeypatch.setattr(cryo_bridge.sys, "argv", ["cryo_bridge"])
+    BridgeRecorder.made = []
+    return monkeypatch
+
+
+def test_main_wires_the_drain_as_the_bridge_role(boot):
+    boot.setenv("CRYO_DRAIN_ENABLED", "true")
+    boot.setenv("CORTEX_CRYO_BRIDGE_PASSWORD", "pw")
+    cryo_bridge.main()
+    (drain,) = BridgeRecorder.made
+    assert isinstance(drain, Drain)
+    assert "user=cortex_cryo_bridge " in drain.dsn
+    assert drain.dsn.endswith("password=pw")
+
+
+def test_main_leaves_the_drain_off_by_default(boot):
+    boot.delenv("CRYO_DRAIN_ENABLED", raising=False)
+    cryo_bridge.main()
+    assert BridgeRecorder.made == [None]
+
+
+def test_main_refuses_the_drain_without_its_password(boot):
+    boot.setenv("CRYO_DRAIN_ENABLED", "true")
+    boot.delenv("CORTEX_CRYO_BRIDGE_PASSWORD", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cryo_bridge.main()
+    assert "CORTEX_CRYO_BRIDGE_PASSWORD" in str(e.value)
+
+
 # --- Drain against a stub cryo.enqueue_mail() that signals like the real one ---
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
-SCHEMA = f"t_drain_{uuid.uuid4().hex[:8]}"
 
 STUB = """
 CREATE TABLE cryo.mail (queue text, key text, message_id text, rule text,
@@ -178,10 +271,13 @@ def live():
     admin = psycopg2.connect(DSN)
     admin.autocommit = True
     with admin.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA {SCHEMA}")
-        cur.execute("CREATE SCHEMA IF NOT EXISTS cryo")
-        cur.execute("DROP FUNCTION IF EXISTS cryo.enqueue_mail(text,jsonb,text,text)")
-        cur.execute("DROP TABLE IF EXISTS cryo.mail")
+        # The stub has the real function's name, so never run against a
+        # database that has cryo's real schema.
+        cur.execute("SELECT to_regnamespace('cryo')")
+        if cur.fetchone()[0] is not None:
+            admin.close()
+            pytest.fail("CORTEX_TEST_DSN has a cryo schema; use a throwaway database")
+        cur.execute("CREATE SCHEMA cryo")
         cur.execute(STUB)
     drain = Drain(DSN)
     try:
@@ -190,7 +286,6 @@ def live():
         if drain.conn is not None:
             drain.conn.close()
         with admin.cursor() as cur:
-            cur.execute(f"DROP SCHEMA {SCHEMA} CASCADE")
             cur.execute("DROP SCHEMA cryo CASCADE")
         admin.close()
 
@@ -204,6 +299,16 @@ def test_drain_reports_queued_then_duplicate(live):
     with admin.cursor() as cur:
         cur.execute("SELECT message_id, rule FROM cryo.mail")
         assert cur.fetchall() == [("g1", "self-note")]
+
+
+def test_drain_sets_its_timeouts(live):
+    drain, _ = live
+    drain.enqueue("drain-article", {"url": "https://e.com/a"}, "g1")
+    with drain.conn.cursor() as cur:
+        cur.execute("SHOW statement_timeout")
+        assert cur.fetchone() == ("30s",)
+        cur.execute("SHOW lock_timeout")
+        assert cur.fetchone() == ("20s",)
 
 
 def test_drain_maps_cry01_to_capped(live):

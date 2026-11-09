@@ -63,6 +63,8 @@ YOUTUBE_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 DRAIN_RULE = "self-note"
 # SQLSTATEs cryo.enqueue_mail() raises: over a daily cap, and off-contract.
 CAPPED, REFUSED = "CRY01", "CRY02"
+# A call waiting on cryo's advisory locks must end well inside the 5 minute claim.
+DRAIN_TIMEOUTS = "-c statement_timeout=30000 -c lock_timeout=20000"
 
 logger = get_logger(__name__)
 
@@ -72,7 +74,9 @@ logger = get_logger(__name__)
 OUTCOMES = Counter(
     "cortex_cryo_bridge_outcomes_total", "Self-note jobs by outcome", ["outcome"]
 )
-# One count per link sent to a drain. `result`: queued, duplicate, capped, refused.
+# One count per link handled in drain mode. `queue` is a drain, or "backlog" for
+# a link that could not drain; `result`: queued, duplicate, capped, refused,
+# unexpanded.
 DRAINS = Counter(
     "cortex_cryo_bridge_drains_total", "Self-note links by drain", ["queue", "result"]
 )
@@ -216,7 +220,9 @@ class Drain:
 
     def enqueue(self, queue: str, payload: dict[str, str], message_id: str) -> str:
         if self.conn is None:
-            self.conn = psycopg2.connect(self.dsn)
+            self.conn = psycopg2.connect(
+                self.dsn, connect_timeout=10, options=DRAIN_TIMEOUTS
+            )
             self.conn.autocommit = True
         try:
             with self.conn.cursor() as cur:
@@ -227,9 +233,17 @@ class Drain:
                 row_id = cur.fetchone()[0]
         except psycopg2.Error as exc:
             if exc.pgcode == CAPPED:
+                logger.warning(
+                    "over cryo's cap, to the backlog", queue=queue, gmail_id=message_id
+                )
                 return "capped"
             if exc.pgcode == REFUSED:
-                logger.error("cryo refused a link", queue=queue, error=str(exc))
+                logger.error(
+                    "cryo refused a link",
+                    queue=queue,
+                    gmail_id=message_id,
+                    error=str(exc),
+                )
                 return "refused"
             self.conn.close()
             self.conn = None
@@ -323,18 +337,22 @@ def drain_links(
     cryo: Cryo,
     drain: Callable[[str, dict[str, str]], str],
 ) -> str:
-    """Send each link to its drain; a link over cryo's cap goes to the backlog."""
-    capped = []
+    """Send each link to its drain. A link over cryo's cap, or a short link that
+    could not be expanded, goes to the backlog at once, so a later failure in
+    the same note cannot lose it."""
+    refused = False
     for url in urls:
+        if _host(url) in SHORTENER_HOSTS:
+            cryo.enqueue([url], title)
+            DRAINS.labels(queue="backlog", result="unexpanded").inc()
+            continue
         queue, payload = drain_target(url)
         result = drain(queue, payload)
         DRAINS.labels(queue=queue, result=result).inc()
         if result == "capped":
-            capped.append(url)
-    if capped:
-        cryo.enqueue(capped, title)
-        logger.warning("links over cryo's cap went to the backlog", links=len(capped))
-    return "drained"
+            cryo.enqueue([url], title)
+        refused = refused or result == "refused"
+    return "drained-refused" if refused else "drained"
 
 
 class Bridge:
@@ -366,7 +384,8 @@ class Bridge:
             if not complete(conn, job["id"], self._worker):
                 logger.warning("claim lost before complete", gmail_id=gmail_id)
                 return "lost"
-            log = logger.error if outcome == "rejected" else logger.info
+            failed = outcome in ("rejected", "drained-refused")
+            log = logger.error if failed else logger.info
             log("self-note handled", gmail_id=gmail_id, outcome=outcome)
             OUTCOMES.labels(outcome=outcome).inc()
             return outcome
