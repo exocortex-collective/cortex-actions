@@ -15,7 +15,6 @@ from tests.test_cryo_bridge import (
     FakeCryo,
     note,
     outcome_count,
-    queue,  # noqa: F401  (fixture)
     run_job,
 )
 
@@ -120,7 +119,7 @@ class RecordingDrain:
         return "queued"
 
 
-def test_the_job_drains_under_its_gmail_id(monkeypatch, queue):  # noqa: F811
+def test_the_job_drains_under_its_gmail_id(monkeypatch, queue):
     drain = RecordingDrain()
     monkeypatch.setattr(cryo_bridge, "load_email", lambda conn, gid: note())
     b = cryo_bridge.Bridge("dsn", ME, FakeCryo(), poll_interval=1, drain=drain)
@@ -132,9 +131,7 @@ def test_the_job_drains_under_its_gmail_id(monkeypatch, queue):  # noqa: F811
     assert outcome_count("drained") == before + 1
 
 
-def test_a_database_failure_while_draining_retries_the_job(
-    monkeypatch, queue
-):  # noqa: F811
+def test_a_database_failure_while_draining_retries_the_job(monkeypatch, queue):
     drain = RecordingDrain(psycopg2.OperationalError("connection refused"))
     monkeypatch.setattr(cryo_bridge, "load_email", lambda conn, gid: note())
     b = cryo_bridge.Bridge("dsn", ME, FakeCryo(), poll_interval=1, drain=drain)
@@ -142,9 +139,7 @@ def test_a_database_failure_while_draining_retries_the_job(
     assert queue["log"] == [("fail_or_retry", 7)]
 
 
-def test_without_a_drain_links_still_go_to_the_backlog(
-    monkeypatch, queue
-):  # noqa: F811
+def test_without_a_drain_links_still_go_to_the_backlog(monkeypatch, queue):
     cryo = FakeCryo()
     assert run_job(monkeypatch, note(), cryo) == "queued"
     assert cryo.calls == [(["https://example.com/a"], "Article title")]
