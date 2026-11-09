@@ -8,6 +8,12 @@ Python decides what is a self-note, extracts the links, and calls cryod.
 "From Devon" is proven, never read from headers: the message must carry
 Gmail's SENT label, which only mail his own account sent has.
 
+With CRYO_DRAIN_ENABLED, each link instead goes straight to one of cryo's
+drains through cryo.enqueue_mail() (cortex-wznn; cryo
+docs/MAIL-TASK-CONTRACT.md): a YouTube video to drain-youtube, anything else
+to drain-article, decided by parsing the URL. A link over cryo's daily cap
+falls back to the backlog, so it is never lost.
+
 Text typed around the links is not sent yet. As a cryo backlog note it would
 bind cryo's classifier as Devon's own words, and share sheets paste article
 snippets into the body, so it waits for cryo to accept a note with the
@@ -37,6 +43,7 @@ from cortex_utils.logging import configure_logging, get_logger
 from cortex_utils.metrics import start_metrics_server
 from cortex_utils.queue import claim, complete, fail_or_retry, worker_identity
 from prometheus_client import Counter
+from psycopg2.extras import Json
 
 SERVICE = "cryo-bridge"
 QUEUE = "cryo-backlog"
@@ -50,6 +57,14 @@ SHORTENER_HOSTS = frozenset({"share.google", "search.app", "goo.gl", "g.co"})
 EXPAND_BUDGET_S = 60
 # Sentence punctuation that ends a pasted URL more often than it belongs to it.
 URL_TRAILING = ".,;:!?"
+YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+YOUTUBE_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+# The rule name cryo's enqueue_mail() maps to the self-note sender class.
+DRAIN_RULE = "self-note"
+# SQLSTATEs cryo.enqueue_mail() raises: over a daily cap, and off-contract.
+CAPPED, REFUSED = "CRY01", "CRY02"
+# A call waiting on cryo's advisory locks must end well inside the 5 minute claim.
+DRAIN_TIMEOUTS = "-c statement_timeout=30000 -c lock_timeout=20000"
 
 logger = get_logger(__name__)
 
@@ -58,6 +73,12 @@ logger = get_logger(__name__)
 # only sign of it. `outcome` is a closed set.
 OUTCOMES = Counter(
     "cortex_cryo_bridge_outcomes_total", "Self-note jobs by outcome", ["outcome"]
+)
+# One count per link handled in drain mode. For a drain, `result` is queued,
+# duplicate, capped or refused; for queue="backlog" (a link that could not
+# drain), it is unexpanded, capped or refused.
+DRAINS = Counter(
+    "cortex_cryo_bridge_drains_total", "Self-note links by drain", ["queue", "result"]
 )
 
 
@@ -159,6 +180,77 @@ def _host(url: str) -> str | None:
         return None
 
 
+def youtube_id(url: str) -> str | None:
+    """The video id of a YouTube watch, short or youtu.be link, else None."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    host, path = parts.hostname, parts.path
+    if host == "youtu.be":
+        candidate = path.lstrip("/").split("/")[0]
+    elif host in YOUTUBE_HOSTS and path == "/watch":
+        candidate = urllib.parse.parse_qs(parts.query).get("v", [""])[0]
+    elif host in YOUTUBE_HOSTS and path.startswith("/shorts/"):
+        candidate = path.split("/")[2]
+    else:
+        return None
+    return candidate if YOUTUBE_ID.fullmatch(candidate) else None
+
+
+def drain_target(url: str) -> tuple[str, dict[str, str]]:
+    """The cryo queue and payload for one link."""
+    video = youtube_id(url)
+    if video:
+        return "drain-youtube", {"video_id": video}
+    return "drain-article", {"url": url}
+
+
+class Drain:
+    """cryo.enqueue_mail() on its own connection, as the cortex_cryo_bridge role.
+
+    Returns "queued" or "duplicate", or "capped" / "refused" for the two
+    refusals the function signals by SQLSTATE. Any other database error is
+    raised, so the job retries.
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.conn: Any = None
+
+    def enqueue(self, queue: str, payload: dict[str, str], message_id: str) -> str:
+        if self.conn is None:
+            self.conn = psycopg2.connect(
+                self.dsn, connect_timeout=10, options=DRAIN_TIMEOUTS
+            )
+            self.conn.autocommit = True
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cryo.enqueue_mail(%s, %s, %s, %s)",
+                    (queue, Json(payload), message_id, DRAIN_RULE),
+                )
+                row_id = cur.fetchone()[0]
+        except psycopg2.Error as exc:
+            if exc.pgcode == CAPPED:
+                logger.warning(
+                    "over cryo's cap, to the backlog", queue=queue, gmail_id=message_id
+                )
+                return "capped"
+            if exc.pgcode == REFUSED:
+                logger.error(
+                    "cryo refused a link",
+                    queue=queue,
+                    gmail_id=message_id,
+                    error=str(exc),
+                )
+                return "refused"
+            self.conn.close()
+            self.conn = None
+            raise
+        return "duplicate" if row_id is None else "queued"
+
+
 class Cryo:
     """The cryod call the bridge makes."""
 
@@ -216,6 +308,7 @@ def bridge(
     self_addr: str,
     cryo: Cryo,
     expand_url: Callable[[str], str] = expand,
+    drain: Callable[[str, dict[str, str]], str] | None = None,
 ) -> str:
     """Hand one email to cryo. Returns the outcome; raises if cryod fails.
     Safe to repeat: cryod skips a url already in that kind's backlog."""
@@ -228,6 +321,8 @@ def bridge(
     urls = list(
         dict.fromkeys(expand_url(u) if time.monotonic() < deadline else u for u in urls)
     )
+    if drain is not None:
+        return drain_links(urls, email.subject or None, cryo, drain)
     short = sum(_host(u) in SHORTENER_HOSTS for u in urls)
     result = cryo.enqueue(urls, email.subject or None)
     logger.info("cryod enqueue", links=len(urls), unexpanded=short, result=result)
@@ -236,11 +331,56 @@ def bridge(
     return "queued-text-held" if text else "queued"
 
 
+def drain_links(
+    urls: list[str],
+    title: str | None,
+    cryo: Cryo,
+    drain: Callable[[str, dict[str, str]], str],
+) -> str:
+    """Send each link to its drain. A link over cryo's cap, or a short link that
+    could not be expanded, goes to the backlog at once, so a later failure in
+    the same note cannot lose it."""
+    refused = False
+
+    def to_backlog(url: str, reason: str) -> bool:
+        """Backlog one link. A permanent cryod refusal is logged and does not
+        stop the rest of the note; anything retryable is raised."""
+        try:
+            result = cryo.enqueue([url], title)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP or exc.code >= 500:
+                raise
+            logger.error("cryod refused a backlog link", reason=reason, status=exc.code)
+            DRAINS.labels(queue="backlog", result="refused").inc()
+            return False
+        logger.info("link to the backlog", reason=reason, result=result)
+        DRAINS.labels(queue="backlog", result=reason).inc()
+        return True
+
+    for url in urls:
+        if _host(url) in SHORTENER_HOSTS:
+            refused |= not to_backlog(url, "unexpanded")
+            continue
+        queue, payload = drain_target(url)
+        result = drain(queue, payload)
+        DRAINS.labels(queue=queue, result=result).inc()
+        if result == "capped":
+            refused |= not to_backlog(url, "capped")
+        refused |= result == "refused"
+    return "drained-refused" if refused else "drained"
+
+
 class Bridge:
     def __init__(
-        self, dsn: str, self_addr: str, cryo: Cryo, poll_interval: int
+        self,
+        dsn: str,
+        self_addr: str,
+        cryo: Cryo,
+        poll_interval: int,
+        drain: Drain | None = None,
     ) -> None:
         self.dsn = dsn
+        self.drain = drain
         self.self_addr = self_addr
         self.cryo = cryo
         self.poll_interval = poll_interval
@@ -259,7 +399,8 @@ class Bridge:
             if not complete(conn, job["id"], self._worker):
                 logger.warning("claim lost before complete", gmail_id=gmail_id)
                 return "lost"
-            log = logger.error if outcome == "rejected" else logger.info
+            failed = outcome in ("rejected", "drained-refused")
+            log = logger.error if failed else logger.info
             log("self-note handled", gmail_id=gmail_id, outcome=outcome)
             OUTCOMES.labels(outcome=outcome).inc()
             return outcome
@@ -281,7 +422,14 @@ class Bridge:
             email = load_email(conn, gmail_id)
             if email is None:
                 raise LookupError(f"no parsed email {gmail_id}")
-            return settle(bridge(email, self.self_addr, self.cryo))
+            drain = None
+            if self.drain is not None:
+                enqueue, message_id = self.drain.enqueue, str(gmail_id)
+
+                def drain(queue: str, payload: dict[str, str]) -> str:
+                    return enqueue(queue, payload, message_id)
+
+            return settle(bridge(email, self.self_addr, self.cryo, drain=drain))
         except urllib.error.HTTPError as exc:
             if exc.code in RETRYABLE_HTTP or exc.code >= 500:
                 return retry(exc)
@@ -343,11 +491,23 @@ def main() -> None:
         f"dbname={os.environ['POSTGRES_DB']} user={os.environ['POSTGRES_USER']} "
         f"password={os.environ['POSTGRES_PASSWORD']}"
     )
+    drain = None
+    if os.environ.get("CRYO_DRAIN_ENABLED", "").lower() == "true":
+        password = os.environ.get("CORTEX_CRYO_BRIDGE_PASSWORD")
+        if not password:
+            sys.exit("CRYO_DRAIN_ENABLED needs CORTEX_CRYO_BRIDGE_PASSWORD")
+        drain = Drain(
+            f"host={os.environ['POSTGRES_HOST']} "
+            f"port={os.environ.get('POSTGRES_PORT', '5432')} "
+            f"dbname={os.environ['POSTGRES_DB']} user=cortex_cryo_bridge "
+            f"password={password}"
+        )
     bridge_ = Bridge(
         dsn,
         os.environ["SELF_ADDRESS"],
         Cryo(os.environ["CRYO_URL"], os.environ["CRYO_TOKEN"]),
         poll_interval=int(os.environ.get("POLL_INTERVAL", "5")),
+        drain=drain,
     )
 
     def on_term(signum: int, frame: FrameType | None) -> None:
