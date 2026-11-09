@@ -1,6 +1,7 @@
 """Self-note links to cryo's drains through cryo.enqueue_mail() (cortex-wznn)."""
 
 import os
+import urllib.error
 
 import psycopg2
 import pytest
@@ -12,6 +13,7 @@ from tests.test_cryo_bridge import (
     ME,
     FakeConn,
     FakeCryo,
+    http,
     note,
     outcome_count,
     run_job,
@@ -128,6 +130,56 @@ def test_a_capped_link_is_backlogged_before_a_later_link_fails():
     assert cryo.calls == [([f"https://youtu.be/{VIDEO}"], "Article title")]
 
 
+class BacklogRefusing(FakeCryo):
+    def __init__(self, code):
+        super().__init__()
+        self.code = code
+
+    def enqueue(self, urls, title):
+        raise http(self.code)
+
+
+def test_a_permanent_backlog_refusal_does_not_stop_the_note():
+    before = drains("backlog", "refused")
+    drain = FakeDrain({VIDEO: "capped"})
+    body = f"https://youtu.be/{VIDEO} https://example.com/a"
+    outcome = bridge(note(body=body), ME, BacklogRefusing(400), lambda u: u, drain)
+    assert outcome == "drained-refused"
+    assert drain.calls[-1] == ("drain-article", {"url": "https://example.com/a"})
+    assert drains("backlog", "refused") == before + 1
+
+
+def test_a_retryable_backlog_failure_is_raised():
+    drain = FakeDrain({VIDEO: "capped"})
+    with pytest.raises(urllib.error.HTTPError):
+        bridge(
+            note(body=f"https://youtu.be/{VIDEO}"),
+            ME,
+            BacklogRefusing(503),
+            lambda u: u,
+            drain,
+        )
+
+
+def test_a_refused_note_is_logged_at_error(monkeypatch, queue):
+    errors = []
+    monkeypatch.setattr(
+        cryo_bridge.logger, "error", lambda msg, **kw: errors.append((msg, kw))
+    )
+    drain = RecordingDrain()
+    drain.enqueue = lambda queue, payload, message_id: "refused"
+    monkeypatch.setattr(cryo_bridge, "load_email", lambda conn, gid: note())
+    b = cryo_bridge.Bridge("dsn", ME, FakeCryo(), poll_interval=1, drain=drain)
+    before = outcome_count("drained-refused")
+    assert b.process(FakeConn(), {"id": 7, "payload": {"gmail_id": "g1"}}) == (
+        "drained-refused"
+    )
+    assert ("self-note handled", {"gmail_id": "g1", "outcome": "drained-refused"}) in (
+        errors
+    )
+    assert outcome_count("drained-refused") == before + 1
+
+
 def test_a_link_less_note_does_not_touch_the_drain():
     drain = FakeDrain()
     assert bridge(note(body="no links"), ME, FakeCryo(), lambda u: u, drain) == (
@@ -221,8 +273,9 @@ def test_main_wires_the_drain_as_the_bridge_role(boot):
     cryo_bridge.main()
     (drain,) = BridgeRecorder.made
     assert isinstance(drain, Drain)
-    assert "user=cortex_cryo_bridge " in drain.dsn
-    assert drain.dsn.endswith("password=pw")
+    assert drain.dsn == (
+        "host=x port=5432 dbname=x user=cortex_cryo_bridge password=pw"
+    )
 
 
 def test_main_leaves_the_drain_off_by_default(boot):
@@ -309,6 +362,7 @@ def test_drain_sets_its_timeouts(live):
         assert cur.fetchone() == ("30s",)
         cur.execute("SHOW lock_timeout")
         assert cur.fetchone() == ("20s",)
+    assert drain.conn.get_dsn_parameters()["connect_timeout"] == "10"
 
 
 def test_drain_maps_cry01_to_capped(live):

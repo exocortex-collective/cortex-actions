@@ -74,9 +74,9 @@ logger = get_logger(__name__)
 OUTCOMES = Counter(
     "cortex_cryo_bridge_outcomes_total", "Self-note jobs by outcome", ["outcome"]
 )
-# One count per link handled in drain mode. `queue` is a drain, or "backlog" for
-# a link that could not drain; `result`: queued, duplicate, capped, refused,
-# unexpanded.
+# One count per link handled in drain mode. For a drain, `result` is queued,
+# duplicate, capped or refused; for queue="backlog" (a link that could not
+# drain), it is unexpanded, capped or refused.
 DRAINS = Counter(
     "cortex_cryo_bridge_drains_total", "Self-note links by drain", ["queue", "result"]
 )
@@ -341,17 +341,32 @@ def drain_links(
     could not be expanded, goes to the backlog at once, so a later failure in
     the same note cannot lose it."""
     refused = False
+
+    def to_backlog(url: str, reason: str) -> bool:
+        """Backlog one link. A permanent cryod refusal is logged and does not
+        stop the rest of the note; anything retryable is raised."""
+        try:
+            result = cryo.enqueue([url], title)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP or exc.code >= 500:
+                raise
+            logger.error("cryod refused a backlog link", reason=reason, status=exc.code)
+            DRAINS.labels(queue="backlog", result="refused").inc()
+            return False
+        logger.info("link to the backlog", reason=reason, result=result)
+        DRAINS.labels(queue="backlog", result=reason).inc()
+        return True
+
     for url in urls:
         if _host(url) in SHORTENER_HOSTS:
-            cryo.enqueue([url], title)
-            DRAINS.labels(queue="backlog", result="unexpanded").inc()
+            refused |= not to_backlog(url, "unexpanded")
             continue
         queue, payload = drain_target(url)
         result = drain(queue, payload)
         DRAINS.labels(queue=queue, result=result).inc()
         if result == "capped":
-            cryo.enqueue([url], title)
-        refused = refused or result == "refused"
+            refused |= not to_backlog(url, "capped")
+        refused |= result == "refused"
     return "drained-refused" if refused else "drained"
 
 
