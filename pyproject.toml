@@ -8,7 +8,7 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     "pyyaml>=6.0.0",
     "structlog>=23.0.0",
-    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@ff1ef5e",
+    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@113f0a7",
 ]
 
 [project.optional-dependencies]

@@ -337,7 +337,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
-    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=ff1ef5e" },
+    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=113f0a7" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.0.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.0" },
@@ -353,7 +353,7 @@ provides-extras = ["dev"]
 [[package]]
 name = "cortex-utils"
 version = "0.1.0"
-source = { git = "https://github.com/devonjones/cortex-utils.git?rev=ff1ef5e#ff1ef5e9e9e417bd6d46b76a7509a2726011d5da" }
+source = { git = "https://github.com/devonjones/cortex-utils.git?rev=113f0a7#113f0a779470c3923db37b3fb4084901ab98da6d" }
 dependencies = [
     { name = "click" },
     { name = "docker" },
